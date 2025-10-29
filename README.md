@@ -19,7 +19,7 @@ The main goal is to implement a distributed system where tasks are delegated to 
 
 The robot employs a classic Host-Controller model common in robotics:
 
-![Rokai System Architecture](docs/images/diagram.png)
+![Rokai System Architecture](docs/images/diagram2.png)
 
 ### 1. Host (Raspberry Pi 5)
 * **Language:** Python
