@@ -1,0 +1,57 @@
+# ===================================================================
+# Python (for the Raspberry Pi)
+# ===================================================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.egg-info/
+.DS_Store
+
+# ===================================================================
+# STM32CubeIDE / Eclipse (for the STM32)
+# ===================================================================
+# Build folders
+Debug/
+Release/
+
+# Build and object files
+*.o
+*.o.d
+*.su
+*.map
+*.elf
+*.bin
+*.ld
+
+# Eclipse project files
+.metadata/
+.settings/
+.project
+.cproject
+
+# ===================================================================
+# ESP32 / Arduino (for the ESP32)
+# ===================================================================
+# Build folders
+build/
+*.bin
+*.elf
+*.partitions.bin
+*.app-bin
+*.map
+
+# Arduino temporary files
+*.ino.bin
+*.ino.elf
+*.ino.hex
+.pio/
+
+# ===================================================================
+# General (Operating system files)
+# ===================================================================
+.DS_Store
+Thumbs.db
