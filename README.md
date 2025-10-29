@@ -11,14 +11,13 @@ This project implements an autonomous navigation system on a differential drive 
 The main goal is to implement a distributed system where tasks are delegated to different processors based on their complexity and real-time requirements:
 * **Host (Raspberry Pi):** High-level planning, complex sensor processing (LIDAR), navigation logic. Does not require strict real-time performance.
 * **Controller (STM32):** Low-level execution, motor control, encoder reading, odometry calculation. Requires **strict real-time performance**.
-* **Co-Processor (ESP32):** Secondary, non-critical tasks (light control).
+* **Co-Processor (ESP32):** Secondary, non-critical tasks (visual feedback via lights).
 
 ---
 
 ## 🛠️ System Architecture (Host-Controller)
 
-The robot employs a classic Host-Controller model common in robotics, communicating via SPI:
-
+The robot employs a classic Host-Controller model common in robotics:
 
 ![Rokai System Architecture](docs/images/diagram.png)
 
@@ -28,7 +27,7 @@ The robot employs a classic Host-Controller model common in robotics, communicat
     * **LIDAR Reading (Dedicated Thread):** A thread (`osensores.py` or `lidar_reader.py`) continuously reads the YDLIDAR asynchronously to avoid blocking the main control loop. Uses `threading` and `Lock` for safe data sharing.
     * **Planning and Control (Main Control Thread):** The `main_robot.py` script (running at ~200Hz):
         * Gets the latest LIDAR data.
-        * Receives the current odometry from the STM32.
+        * Receives the current odometry from the STM32 via SPI.
         * Calculates **Artificial Potential Field** forces (attraction to the goal `xd, yd` and repulsion from obstacles).
         * Sends the resulting velocity vector (`ux_global`, `uy_global`) and `maxspeed` to the STM32 via SPI.
 * **Key Libraries:** `spidev`, `numpy`, `threading`.
@@ -44,12 +43,14 @@ The robot employs a classic Host-Controller model common in robotics, communicat
         * Running the speed **PI Controller** for each motor (with Anti-Windup).
         * Calculating **Odometry** (`x`, `y`, `th`), protecting shared variables with `taskENTER_CRITICAL`.
         * Generating PWM signals for motor drivers.
-    * **`vLedTask` (Low Priority):** Runs less frequently (~100ms). Encodes the robot's state (e.g., moving, stopped, near obstacle) and sends it via UART to the ESP32 for visual feedback (lights), without interrupting critical control.
-* **Communication:** Receives commands via SPI (protected in ISR with `taskENTER_CRITICAL_FROM_ISR`) and sends state via UART.
+    * **`vLedTask` (Low Priority):** Runs less frequently (~100ms). Determines the robot's state (e.g., moving, stopped, turning) based on wheel speeds. **Encodes** this state into a **4-bit binary value** and **outputs it directly to 4 GPIO pins** connected to the ESP32. This avoids interrupting the critical control task.
+* **Communication:**
+    * Receives commands from Host via **SPI** (protected in ISR with `taskENTER_CRITICAL_FROM_ISR`).
+    * Sends encoded state to ESP32 via **4 dedicated GPIO lines**.
 
 ### 3. Co-Processor (ESP32)
 * **Language:** C++ (Arduino Framework/ESP-IDF)
-* **Main Task:** Receives UART messages from the STM32, decodes the robot's state, and controls LEDs (e.g., Neopixels) to visually indicate the robot's actions.
+* **Main Task:** Continuously **reads the state of the 4 GPIO input pins** connected to the STM32. **Decodes** the 4-bit binary value to understand the robot's state (moving forward, turning left, etc.) and controls LEDs (e.g., Neopixels) to provide corresponding visual feedback.
 
 ---
 
@@ -60,7 +61,9 @@ The robot employs a classic Host-Controller model common in robotics, communicat
 * **Main Controller:** Board with STM32G474CEU6
 * **Secondary Controller:** ESP32 Module
 * **Actuators:** Differential drive robot chassis, 2x DC Motors with Quadrature Encoders, Motor Drivers (H-Bridge).
-* **Communication:** Wiring for SPI and UART.
+* **Communication:**
+    * Wiring for **SPI** (RasPi <-> STM32).
+    * **4x GPIO wires** (STM32 -> ESP32) for state encoding.
 
 ---
 
