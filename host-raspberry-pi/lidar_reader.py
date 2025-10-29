@@ -1,151 +1,302 @@
+# -*- coding: utf-8 -*-
+"""
+lidar_reader.py (or osensores.py)
+
+Module for handling YDLIDAR sensor readings asynchronously using a background thread.
+
+This module initializes the YDLIDAR sensor, reads scan data in a separate thread
+to avoid blocking the main application, pre-processes the data (e.g., inverts angles),
+and provides a thread-safe way to access the latest available scan data.
+
+Key Features:
+- Initializes and configures the YDLIDAR.
+- Runs LIDAR data acquisition in a dedicated background thread.
+- Pre-processes scan data (inverts angles).
+- Provides a thread-safe function (`obtener_datos`) to get the latest scan.
+- Handles clean shutdown of the LIDAR and the background thread.
+- Optimized for minimal lock contention between the reader thread and data consumers.
+
+Usage:
+1. Call `inicializar_lidar_en_fondo()` to start the sensor and background thread.
+2. In your main loop, call `obtener_datos()` frequently to get the latest scan data.
+3. Call `detener_lidar()` before your application exits to ensure clean shutdown.
+"""
 
 import threading
 import time
 import sys
+import os # Added for path joining
 
-# Asegúrate de que esta ruta sea correcta para tu sistema
-sys.path.append("/usr/local/lib/python3.12/dist-packages/ydlidar-1.2.4-py3.12-linux-aarch64.egg/")
+# --- YDLIDAR Library Path Configuration ---
+# Ensure this path points correctly to your ydlidar .egg file or installation directory
+# Example using relative path (adjust if needed)
+# SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# EGG_PATH = os.path.join(SCRIPT_DIR, "../path/to/your/ydlidar-1.2.4-py3.12-linux-aarch64.egg")
+EGG_PATH = "/usr/local/lib/python3.12/dist-packages/ydlidar-1.2.4-py3.12-linux-aarch64.egg/" # Your specific path
+if EGG_PATH not in sys.path:
+    sys.path.append(EGG_PATH)
+
 try:
     import ydlidar
 except ImportError:
-    print("Error: No se pudo importar ydlidar. Verifica la ruta en sys.path.append.")
+    print(f"FATAL ERROR: Could not import ydlidar. Check the path in sys.path: {EGG_PATH}")
     sys.exit(1)
 
-# --- Variables Globales del Módulo ---
-# Usamos un diccionario vacío como "puntero" inicial.
-_datos_lidar = {}
-_lock = threading.Lock() # Lock interno del módulo
+# --- Module Global Variables ---
 
-# Control del hilo
-_thread = None
+# Stores the latest processed LIDAR scan data.
+# Format: {"angle": [float,...], "range": [float,...], "intensity": [float,...]}
+# Initialized as empty dict to indicate no data received yet.
+_latest_lidar_data = {}
+# Thread lock to ensure thread-safe access to _latest_lidar_data.
+_lock = threading.Lock()
+
+# Background thread management
+_lidar_thread = None
 _running = False
 _laser = None
-_scan = None # Inicializar como None
+_scan = None # LaserScan object, initialized later for thread safety if needed
 
-def _leer_lidar():
+def _read_lidar_loop():
     """
-    Función que corre en el hilo de fondo. Lee y pre-procesa datos LIDAR.
+    Internal function executed by the background thread.
+    Continuously reads from the LIDAR, processes data, and updates the shared variable.
     """
-    global _datos_lidar, _running, _laser, _scan
+    global _latest_lidar_data, _running, _laser, _scan
 
+    # Best practice: Initialize objects used only by this thread here.
     if _scan is None:
         _scan = ydlidar.LaserScan()
+        if _scan is None:
+             print("FATAL ERROR: Failed to create ydlidar.LaserScan object in thread.")
+             _running = False # Stop the thread if object creation fails
+             return
 
+    print("LIDAR reading thread started.")
     while _running:
         try:
-            if _laser.doProcessSimple(_scan):
-                # 1. PRE-PROCESAR DATOS FUERA DEL LOCK
-                ang = []
-                dist = []
-                inten = []
-                points_data = _scan.points if hasattr(_scan, 'points') else []
-                for p in points_data:
-                    ang.append(-p.angle) # Invertir ángulo AQUÍ
-                    dist.append(p.range)
-                    inten.append(p.intensity)
+            # doProcessSimple is a blocking call, waits for a full scan (~100ms at 10Hz)
+            if _laser and hasattr(_laser, 'doProcessSimple') and _laser.doProcessSimple(_scan):
+                # 1. PROCESS DATA OUTSIDE THE LOCK for efficiency
+                angles_rad = []
+                ranges_m = []
+                intensities = []
 
+                # Check if _scan has 'points' attribute before iterating
+                points_data = _scan.points if _scan and hasattr(_scan, 'points') else []
+
+                for point in points_data:
+                    # Pre-process: Invert angle (adjust sign if needed for your coordinate system)
+                    angles_rad.append(-point.angle) # Angle in radians
+                    ranges_m.append(point.range)     # Range in meters
+                    intensities.append(point.intensity) # Intensity value
+
+                # Prepare the new data dictionary
                 new_data = {
-                    "angle": ang,
-                    "range": dist,
-                    "intensity": inten
+                    "angle": angles_rad,
+                    "range": ranges_m,
+                    "intensity": intensities
                 }
 
-                # 2. SECCIÓN CRÍTICA MÍNIMA (MUY RÁPIDA)
-                # Solo actualiza la referencia al diccionario.
+                # 2. MINIMAL CRITICAL SECTION (VERY FAST)
+                # Update the shared variable with the new data reference.
                 with _lock:
-                    _datos_lidar = new_data
+                    _latest_lidar_data = new_data
 
-            # else: # Si no hubo scan, podrías añadir una pausa mínima
-                # time.sleep(0.001)
+            # else:
+                # Optional: Handle cases where doProcessSimple returns false (e.g., timeout)
+                # print("Warning: doProcessSimple did not return a valid scan.")
+                # time.sleep(0.001) # Small delay if no scan to prevent busy-wait
 
+        except AttributeError as ae:
+             # Catch cases where _laser might become None unexpectedly during shutdown
+             print(f"AttributeError in _read_lidar_loop (likely during shutdown): {ae}")
+             time.sleep(0.1)
         except Exception as e:
-            print(f"Error en hilo _leer_lidar: {e}")
-            time.sleep(0.1) # Pausa antes de reintentar
+            print(f"ERROR in _read_lidar_loop: {e}")
+            # Consider adding more robust error handling, e.g., attempt reconnect?
+            time.sleep(0.5) # Pause before retrying after an error
 
-        # 3. ELIMINADO time.sleep(0.01) - innecesario
+    print("LIDAR reading thread stopped.")
+
 
 def inicializar_lidar_en_fondo():
     """
-    Configura, inicializa el LIDAR e inicia el hilo de lectura.
+    Initializes the YDLIDAR sensor and starts the background reading thread.
+
+    Configures the LIDAR parameters (port, baudrate, scan frequency, etc.),
+    turns on the laser, and launches the `_read_lidar_loop` in a daemon thread.
+
+    Returns:
+        bool: True if initialization was successful, False otherwise.
     """
-    global _laser, _thread, _running, _scan
-    if _thread is not None and _thread.is_alive(): return True # Ya inicializado
+    global _laser, _lidar_thread, _running, _scan
+    # Prevent re-initialization if already running
+    if _lidar_thread is not None and _lidar_thread.is_alive():
+        print("INFO: LIDAR already initialized and running.")
+        return True
 
-    ydlidar.os_init()
-    ports = ydlidar.lidarPortList()
-    port = "/dev/ydlidar"
-    detected_port = None
-    for key, value in ports.items(): detected_port = value; break
-    if detected_port: port = detected_port
-    else: print(f"WARN: Puerto LIDAR no detectado, usando default: {port}")
-    print(f"Usando puerto LIDAR: {port}")
+    print("Initializing YDLIDAR...")
+    try:
+        ydlidar.os_init()
+        ports = ydlidar.lidarPortList()
+        port = "/dev/ydlidar" # Default port
+        detected_port = None
+        # Simple detection: use the first available port
+        for key, value in ports.items():
+            detected_port = value
+            break # Use the first one found
 
-    _laser = ydlidar.CYdLidar()
-    # === TU CONFIGURACIÓN ORIGINAL ===
-    _laser.setlidaropt(ydlidar.LidarPropSerialPort, port)
-    _laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 230400)
-    _laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TRIANGLE)
-    _laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
-    _laser.setlidaropt(ydlidar.LidarPropScanFrequency, 10.0)
-    _laser.setlidaropt(ydlidar.LidarPropSampleRate, 4)
-    _laser.setlidaropt(ydlidar.LidarPropSingleChannel, False)
-    _laser.setlidaropt(ydlidar.LidarPropMaxAngle, 180.0)
-    _laser.setlidaropt(ydlidar.LidarPropMinAngle, -180.0)
-    _laser.setlidaropt(ydlidar.LidarPropMaxRange, 16.0)
-    _laser.setlidaropt(ydlidar.LidarPropMinRange, 0.02)
-    _laser.setlidaropt(ydlidar.LidarPropIntenstiy, True)
-    # ==================================
-    _scan = ydlidar.LaserScan() # Crear instancia Scan
-
-    ret = _laser.initialize()
-    if ret:
-        ret = _laser.turnOn()
-        if ret:
-            _running = True
-            _thread = threading.Thread(target=_leer_lidar, daemon=True)
-            _thread.start()
-            print("LIDAR inicializado y leyendo en fondo...")
-            return True
+        if detected_port:
+            port = detected_port
+            print(f"Detected LIDAR port: {port}")
         else:
-            print("Error: No se pudo encender el LIDAR"); _laser.disconnecting(); return False
-    else:
-        print("Error: No se pudo inicializar el LIDAR"); return False
+            print(f"WARN: Could not auto-detect LIDAR port. Using default: {port}")
+
+        _laser = ydlidar.CYdLidar()
+
+        # --- LIDAR Configuration (Your Original Settings) ---
+        _laser.setlidaropt(ydlidar.LidarPropSerialPort, port)
+        _laser.setlidaropt(ydlidar.LidarPropSerialBaudrate, 230400) # Common for YDLIDAR
+        _laser.setlidaropt(ydlidar.LidarPropLidarType, ydlidar.TYPE_TRIANGLE) # Check if correct for your model
+        _laser.setlidaropt(ydlidar.LidarPropDeviceType, ydlidar.YDLIDAR_TYPE_SERIAL)
+        _laser.setlidaropt(ydlidar.LidarPropScanFrequency, 10.0) # Target scan rate (Hz)
+        _laser.setlidaropt(ydlidar.LidarPropSampleRate, 4) # Check datasheet for optimal value (e.g., 4, 5, 9)
+        _laser.setlidaropt(ydlidar.LidarPropSingleChannel, False) # Check if your LIDAR is single/dual channel
+        _laser.setlidaropt(ydlidar.LidarPropMaxAngle, 180.0) # Max angle (degrees)
+        _laser.setlidaropt(ydlidar.LidarPropMinAngle, -180.0) # Min angle (degrees)
+        _laser.setlidaropt(ydlidar.LidarPropMaxRange, 16.0) # Max range (meters)
+        _laser.setlidaropt(ydlidar.LidarPropMinRange, 0.02) # Min range (meters) - adjust based on specs
+        _laser.setlidaropt(ydlidar.LidarPropIntenstiy, True) # Enable intensity readings
+        # --- End Configuration ---
+
+        # Initialize LaserScan object here if required by library specifics
+        _scan = ydlidar.LaserScan()
+
+        # Attempt to initialize the laser driver
+        ret = _laser.initialize()
+        if ret:
+            print("YDLIDAR Driver Initialized.")
+            # Attempt to turn on the laser scanning
+            ret = _laser.turnOn()
+            if ret:
+                print("YDLIDAR Laser Turned On.")
+                _running = True
+                # Start the background thread as a daemon thread
+                _lidar_thread = threading.Thread(target=_read_lidar_loop, daemon=True)
+                _lidar_thread.start()
+                print("LIDAR background reading thread started.")
+                return True
+            else:
+                print("ERROR: Failed to turn on LIDAR laser.")
+                error_msg = _laser.getLastError() if hasattr(_laser, 'getLastError') else "N/A"
+                print(f"Laser Error: {error_msg}")
+                _laser.disconnecting() # Clean up driver
+                return False
+        else:
+            print("ERROR: Failed to initialize YDLIDAR driver.")
+            error_msg = _laser.getLastError() if hasattr(_laser, 'getLastError') else "N/A"
+            print(f"Initialization Error: {error_msg}")
+            return False
+
+    except Exception as e:
+        print(f"FATAL ERROR during LIDAR initialization: {e}")
+        # Clean up in case of partial initialization
+        if _laser:
+            try: _laser.disconnecting()
+            except: pass
+        _laser = None
+        return False
 
 def obtener_datos():
     """
-    Obtiene una copia segura y pre-procesada de los últimos datos LIDAR.
-    Optimizado para mínima contención del lock.
+    Retrieves a thread-safe copy of the latest available LIDAR scan data.
+
+    This function is optimized for speed by minimizing the time the internal
+    lock is held. It performs data copying outside the critical section.
+
+    Returns:
+        tuple: A tuple containing three lists:
+               (angles [radians], ranges [meters], intensities [unitless]).
+               Returns empty lists ([], [], []) if no data is available yet.
+               Angles are relative to the LIDAR's forward direction and are
+               pre-inverted (negative sign applied) as processed by the reader thread.
     """
-    global _datos_lidar
+    global _latest_lidar_data
 
-    # 1. SECCIÓN CRÍTICA MÍNIMA (MUY RÁPIDA)
-    # Obtiene la referencia al último diccionario completo.
+    # 1. MINIMAL CRITICAL SECTION (VERY FAST)
+    # Get the reference to the latest data dictionary.
     with _lock:
-        current_data = _datos_lidar
+        current_data = _latest_lidar_data
 
-    # 2. COPIA LOS DATOS FUERA DEL LOCK
+    # 2. COPY DATA OUTSIDE THE LOCK
+    # Check if the dictionary is not empty (i.e., first scan received)
     if current_data:
-        # El [:] hace una copia superficial (eficiente para listas de números)
-        ang = current_data["angle"][:]
-        dist = current_data["range"][:]
-        inten = current_data["intensity"][:]
-        # El ángulo ya viene invertido desde _leer_lidar
+        # Use slicing [:] to create shallow copies of the lists.
+        # This is efficient for lists of numbers and ensures the caller
+        # gets a snapshot that won't be modified by the reader thread.
+        ang = current_data.get("angle", [])[:] # Use .get with default and copy
+        dist = current_data.get("range", [])[:]
+        inten = current_data.get("intensity", [])[:]
         return ang, dist, inten
     else:
-        return [], [], [] # Retorna vacío si no hay datos aún
+        # Return empty lists if no data has been received yet
+        return [], [], []
 
 def detener_lidar():
-    """ Detiene el hilo y apaga el LIDAR de forma segura. """
-    global _running, _thread, _laser
-    if not _running: return
-    _running = False
-    print("Deteniendo el LIDAR...")
-    if _thread is not None and _thread.is_alive():
-        _thread.join(timeout=0.5)
-    if _laser:
-        try: _laser.turnOff(); _laser.disconnecting()
-        except Exception as e: print(f"Error al detener LIDAR: {e}")
-    print("LIDAR detenido.")
-    _thread = None; _laser = None
+    """
+    Safely stops the background LIDAR thread and turns off the laser.
 
-# (Bloque if _name_ == "_main_": opcional para pruebas rápidas aquí)
+    Should be called before the main application exits.
+    """
+    global _running, _lidar_thread, _laser
+    if not _running:
+        print("INFO: LIDAR already stopped or not initialized.")
+        return
+
+    print("Stopping LIDAR...")
+    _running = False # Signal the thread to stop
+
+    # Wait briefly for the thread to exit its loop
+    if _lidar_thread is not None and _lidar_thread.is_alive():
+        print("Waiting for LIDAR thread to join...")
+        _lidar_thread.join(timeout=1.0) # Wait up to 1 second
+        if _lidar_thread.is_alive():
+            print("WARN: LIDAR thread did not exit cleanly after 1 second.")
+
+    # Turn off laser and disconnect driver
+    if _laser:
+        print("Turning off laser and disconnecting driver...")
+        try:
+            _laser.turnOff()
+            _laser.disconnecting()
+            print("LIDAR laser off and driver disconnected.")
+        except Exception as e:
+            print(f"ERROR during LIDAR shutdown: {e}")
+
+    # Clear references
+    _lidar_thread = None
+    _laser = None
+    print("LIDAR shutdown complete.")
+
+# --- Optional: Self-test block ---
+if __name__ == "__main__":
+    """ Quick test to run if the module is executed directly """
+    print("Running LIDAR reader module self-test...")
+    if inicializar_lidar_en_fondo():
+        try:
+            print("LIDAR initialized. Reading scans for 5 seconds...")
+            for i in range(10): # Try getting data 10 times
+                time.sleep(0.5)
+                angles, ranges, intensities = obtener_datos()
+                if ranges:
+                    print(f"Scan {i+1}: Received {len(ranges)} points. First point: range={ranges[0]:.2f}m, angle={math.degrees(angles[0]):.1f}deg")
+                else:
+                    print(f"Scan {i+1}: Waiting for data...")
+            print("Test complete.")
+        except KeyboardInterrupt:
+            print("\nTest interrupted by user.")
+        finally:
+            detener_lidar()
+    else:
+        print("Self-test failed: Could not initialize LIDAR.")
