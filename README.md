@@ -20,7 +20,7 @@ The main goal is to implement a distributed system where tasks are delegated to 
 The robot employs a classic Host-Controller model common in robotics, communicating via SPI:
 
 
-* **Diagram:** (Optional but highly recommended: Create a simple diagram showing RasPi -> SPI -> STM32 -> UART -> ESP32 and upload it to a `docs/images` folder)
+![Rokai System Architecture](docs/images/diagram.png)
 
 ### 1. Host (Raspberry Pi 5)
 * **Language:** Python
